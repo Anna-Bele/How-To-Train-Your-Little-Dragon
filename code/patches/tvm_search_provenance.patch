@@ -1,0 +1,760 @@
+diff --git a/include/tvm/s_tir/meta_schedule/measure_candidate.h b/include/tvm/s_tir/meta_schedule/measure_candidate.h
+index 810856479..a2eeb9f6c 100644
+--- a/include/tvm/s_tir/meta_schedule/measure_candidate.h
++++ b/include/tvm/s_tir/meta_schedule/measure_candidate.h
+@@ -21,6 +21,8 @@
+ #define TVM_S_TIR_META_SCHEDULE_MEASURE_CANDIDATE_H_
+ 
+ #include <tvm/ffi/container/array.h>
++#include <tvm/ffi/container/map.h>
++#include <tvm/ffi/optional.h>
+ #include <tvm/ffi/reflection/registry.h>
+ #include <tvm/runtime/base.h>
+ #include <tvm/s_tir/meta_schedule/arg_info.h>
+@@ -37,12 +39,15 @@ class MeasureCandidateNode : public ffi::Object {
+   s_tir::Schedule sch;
+   /*! \brief The argument information, e.g., (shape, dtype) for tensors. */
+   ffi::Array<ArgInfo> args_info;
++  /*! \brief Optional search-strategy provenance attached to this candidate. */
++  ffi::Optional<ffi::Map<ffi::String, ffi::Any>> provenance;
+ 
+   static void RegisterReflection() {
+     namespace refl = tvm::ffi::reflection;
+     refl::ObjectDef<MeasureCandidateNode>()
+         .def_ro("sch", &MeasureCandidateNode::sch)
+-        .def_ro("args_info", &MeasureCandidateNode::args_info);
++        .def_ro("args_info", &MeasureCandidateNode::args_info)
++        .def_ro("provenance", &MeasureCandidateNode::provenance);
+   }
+   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("s_tir.meta_schedule.MeasureCandidate", MeasureCandidateNode,
+                                     ffi::Object);
+@@ -58,8 +63,11 @@ class MeasureCandidate : public ffi::ObjectRef {
+    * \brief Constructor of MeasureCandidate.
+    * \param sch The schedule for measurement.
+    * \param args_info The argument information, e.g., (shape, dtype) for tensors.
++   * \param provenance Optional search-strategy provenance.
+    */
+-  TVM_DLL MeasureCandidate(s_tir::Schedule sch, ffi::Array<ArgInfo> args_info);
++  TVM_DLL MeasureCandidate(
++      s_tir::Schedule sch, ffi::Array<ArgInfo> args_info,
++      ffi::Optional<ffi::Map<ffi::String, ffi::Any>> provenance = std::nullopt);
+   TVM_FFI_DEFINE_OBJECT_REF_METHODS_NOTNULLABLE(MeasureCandidate, ffi::ObjectRef,
+                                                 MeasureCandidateNode);
+ };
+diff --git a/python/tvm/s_tir/meta_schedule/search_strategy/search_strategy.py b/python/tvm/s_tir/meta_schedule/search_strategy/search_strategy.py
+index b03208783..73ced24ac 100644
+--- a/python/tvm/s_tir/meta_schedule/search_strategy/search_strategy.py
++++ b/python/tvm/s_tir/meta_schedule/search_strategy/search_strategy.py
+@@ -21,7 +21,7 @@ candidates for measurement.
+ """
+ 
+ from collections.abc import Callable
+-from typing import TYPE_CHECKING, Optional, Union
++from typing import TYPE_CHECKING, Any, Optional, Union
+ 
+ # isort: off
+ from typing import Literal
+@@ -52,15 +52,19 @@ class MeasureCandidate(Object):
+         The schedule to be measured.
+     args_info : List[ArgInfo]
+         The argument information.
++    provenance : Optional[Dict[str, Any]]
++        Search-strategy provenance, when supplied by the strategy.
+     """
+ 
+     sch: Schedule
+     args_info: list[ArgInfo]
++    provenance: dict[str, Any] | None
+ 
+     def __init__(
+         self,
+         sch: Schedule,
+         args_info: list[ArgInfo],
++        provenance: dict[str, Any] | None = None,
+     ) -> None:
+         """Constructor.
+ 
+@@ -70,11 +74,14 @@ class MeasureCandidate(Object):
+             The schedule to be measured.
+         args_info : List[ArgInfo]
+             The argument information.
++        provenance : Optional[Dict[str, Any]]
++            Search-strategy provenance, when supplied by the strategy.
+         """
+         self.__init_handle_by_constructor__(
+             _ffi_api.MeasureCandidate,  # type: ignore # pylint: disable=no-member
+             sch,
+             args_info,
++            provenance,
+         )
+ 
+ 
+diff --git a/src/s_tir/meta_schedule/search_strategy/evolutionary_search.cc b/src/s_tir/meta_schedule/search_strategy/evolutionary_search.cc
+index 6cad2846d..c83e95288 100644
+--- a/src/s_tir/meta_schedule/search_strategy/evolutionary_search.cc
++++ b/src/s_tir/meta_schedule/search_strategy/evolutionary_search.cc
+@@ -20,7 +20,10 @@
+ #include <tvm/ffi/cast.h>
+ #include <tvm/ffi/reflection/registry.h>
+ 
++#include <memory>
+ #include <mutex>
++#include <string>
++#include <utility>
+ 
+ #include "../module_equality.h"
+ #include "../utils.h"
+@@ -71,6 +74,34 @@ class IRModuleSet {
+   std::unordered_set<Item, ItemHash, ItemEqual> tab_;
+ };
+ 
++/*! \brief One successful evolutionary mutation in a candidate's exact ancestry. */
++struct MutationProvenance {
++  std::shared_ptr<const MutationProvenance> parent;
++  int generation;
++  int thread_id;
++  int retry_index;
++  int parent_population_index;
++  ffi::String mutator_type{""};
++  TRandState rng_state_before;
++  TRandState rng_state_after;
++  double parent_normalized_score;
++  s_tir::Trace parent_trace;
++  s_tir::Trace mutated_trace;
++};
++
++/*! \brief A schedule plus search-only metadata carried until measurement selection. */
++struct SearchCandidate {
++  Schedule sch{nullptr};
++  ffi::String root_source{""};
++  int root_source_index{-1};
++  int initial_population_slot{-1};
++  s_tir::Trace root_trace;
++  std::shared_ptr<const MutationProvenance> lineage;
++  ffi::String selection_source{""};
++  bool has_predicted_score{false};
++  double predicted_normalized_score{0.0};
++};
++
+ /*!
+  * \brief A heap with a size up-limit. If overflow happens, it evicted the worst items.
+  * \note It maintains a min heap in terms of `Item::score`. Therefore, when
+@@ -80,7 +111,7 @@ class IRModuleSet {
+ class SizedHeap {
+  public:
+   struct Item {
+-    Schedule sch;
++    SearchCandidate candidate;
+     double score;
+     bool operator<(const Item& other) const { return score > other.score; }
+   };
+@@ -95,16 +126,19 @@ class SizedHeap {
+    * \brief Push the specific item to the heap if its key did not appears in the heap
+    * \param item The item to be pushed
+    */
+-  void Push(Schedule sch, double score) {
++  void Push(const SearchCandidate& candidate, double score) {
++    SearchCandidate scored = candidate;
++    scored.has_predicted_score = true;
++    scored.predicted_normalized_score = score;
+     int size = heap.size();
+     if (size < size_limit) {
+       // Heap is not full, just push
+-      heap.emplace_back(Item{sch, score});
++      heap.emplace_back(Item{std::move(scored), score});
+       std::push_heap(heap.begin(), heap.end());
+     } else if (score > heap.front().score) {
+       // if the item is better than the worst one in the heap, we can safely kick it out
+       std::pop_heap(heap.begin(), heap.end());
+-      heap.back() = {sch, score};
++      heap.back() = {std::move(scored), score};
+       std::push_heap(heap.begin(), heap.end());
+     }
+     // Otherwise, the item is worse than any other element in the heap
+@@ -212,6 +246,63 @@ struct ConcurrentBitmask {
+ 
+ /**************** Util Functions ****************/
+ 
++/*! \brief Convert an exact native mutation lineage into FFI containers for Python. */
++ffi::Map<ffi::String, ffi::Any> SerializeProvenance(const SearchCandidate& candidate) {
++  std::vector<std::shared_ptr<const MutationProvenance>> lineage;
++  for (std::shared_ptr<const MutationProvenance> step = candidate.lineage; step;
++       step = step->parent) {
++    lineage.push_back(step);
++  }
++  std::reverse(lineage.begin(), lineage.end());
++
++  ffi::Array<ffi::Any> mutations;
++  mutations.reserve(lineage.size());
++  for (int index = 0, size = lineage.size(); index < size; ++index) {
++    const MutationProvenance& step = *lineage[index];
++    ffi::Map<ffi::String, ffi::Any> mutation;
++    mutation.Set("mutation_index", static_cast<int64_t>(index));
++    mutation.Set("generation", static_cast<int64_t>(step.generation));
++    mutation.Set("thread_id", static_cast<int64_t>(step.thread_id));
++    mutation.Set("retry_index", static_cast<int64_t>(step.retry_index));
++    mutation.Set("parent_population_index",
++                 static_cast<int64_t>(step.parent_population_index));
++    mutation.Set("mutator_type", step.mutator_type);
++    mutation.Set("rng_state_before", static_cast<int64_t>(step.rng_state_before));
++    mutation.Set("rng_state_after", static_cast<int64_t>(step.rng_state_after));
++    mutation.Set("parent_normalized_score", step.parent_normalized_score);
++    mutation.Set("parent_trace_json", step.parent_trace->AsJSON(/*remove_postproc=*/true));
++    mutation.Set("mutated_trace_json", step.mutated_trace->AsJSON(/*remove_postproc=*/true));
++    mutations.push_back(std::move(mutation));
++  }
++
++  ffi::Map<ffi::String, ffi::Any> origin;
++  origin.Set("type", candidate.root_source);
++  origin.Set("source_index", static_cast<int64_t>(candidate.root_source_index));
++  origin.Set("initial_population_slot",
++             static_cast<int64_t>(candidate.initial_population_slot));
++
++  ffi::Map<ffi::String, ffi::Any> selection;
++  selection.Set("source", candidate.selection_source);
++  if (candidate.has_predicted_score) {
++    selection.Set("predicted_normalized_score", candidate.predicted_normalized_score);
++  }
++
++  ffi::Map<ffi::String, ffi::Any> provenance;
++  provenance.Set("schema_version", static_cast<int64_t>(1));
++  provenance.Set("available", true);
++  provenance.Set("strategy", ffi::String("evolutionary"));
++  provenance.Set("origin", std::move(origin));
++  provenance.Set("root_trace_json",
++                 candidate.root_trace->AsJSON(/*remove_postproc=*/true));
++  provenance.Set("mutation_count", static_cast<int64_t>(mutations.size()));
++  provenance.Set("mutations", std::move(mutations));
++  provenance.Set("selection", std::move(selection));
++  provenance.Set(
++      "final_trace_json_without_postproc",
++      candidate.sch->trace().value()->AsJSON(/*remove_postproc=*/true));
++  return provenance;
++}
++
+ /*!
+  * \brief Assemble measure candidates from the given candidate traces.
+  * \param traces The picked candidate traces.
+@@ -227,6 +318,20 @@ ffi::Array<MeasureCandidate> AssembleCandidates(const std::vector<Schedule>& pic
+   return measure_inputs;
+ }
+ 
++/*! \brief Assemble final measured candidates with their exact evolutionary provenance. */
++ffi::Array<MeasureCandidate> AssembleCandidatesWithProvenance(
++    const std::vector<SearchCandidate>& picks) {
++  ffi::Array<MeasureCandidate> measure_inputs;
++  measure_inputs.reserve(picks.size());
++  for (const SearchCandidate& candidate : picks) {
++    const Schedule& sch = candidate.sch;
++    measure_inputs.push_back(MeasureCandidate(
++        sch, ArgInfo::FromEntryFunc(sch->mod(), /*remove_preproc=*/true),
++        SerializeProvenance(candidate)));
++  }
++  return measure_inputs;
++}
++
+ /*!
+  * \brief Predict the normalized score of each candidate.
+  * \param candidates The candidates for prediction
+@@ -313,21 +418,22 @@ class EvolutionarySearchNode : public SearchStrategyNode {
+      * \param num The number of traces to produce.
+      * \return The picked best candidates.
+      */
+-    inline std::vector<Schedule> PickBestFromDatabase(int num);
++    inline std::vector<SearchCandidate> PickBestFromDatabase(int num);
+     /*!
+      * \brief Sample the initial population from previous measured results and randomly generated
+      *  traces via trace replaying.
+      * \param num The number of traces to produce.
+      * \return The initial population of traces sampled.
+      */
+-    inline std::vector<Schedule> SampleInitPopulation(int num);
++    inline std::vector<SearchCandidate> SampleInitPopulation(int num);
+     /*!
+      * \brief Evolve the initial population using mutators and samplers.
+      * \param population The initial population of traces sampled.
+      * \param num The number of traces to produce.
+      * \return The evolved traces from initial population.
+      */
+-    inline std::vector<Schedule> EvolveWithCostModel(std::vector<Schedule> population, int num);
++    inline std::vector<SearchCandidate> EvolveWithCostModel(
++        std::vector<SearchCandidate> population, int num);
+     /*!
+      * \brief Pick final candidates from the given initial population and bests of evolved ones.
+      * \param inits The initial population of traces sampled.
+@@ -335,8 +441,9 @@ class EvolutionarySearchNode : public SearchStrategyNode {
+      * \param num The number of traces to produce.
+      * \return The final picked candidates with a ratio of both.
+      */
+-    inline std::vector<Schedule> PickWithEpsGreedy(const std::vector<Schedule>& inits,
+-                                                   const std::vector<Schedule>& bests, int num);
++    inline std::vector<SearchCandidate> PickWithEpsGreedy(
++        const std::vector<SearchCandidate>& inits,
++        const std::vector<SearchCandidate>& bests, int num);
+     /*! \brief An interface method to be called by it's counterpart in EvolutionarySearchNode */
+     inline ffi::Optional<ffi::Array<MeasureCandidate>> GenerateMeasureCandidates();
+     /*! \brief An interface method to be called by it's counterpart in EvolutionarySearchNode */
+@@ -478,7 +585,7 @@ class EvolutionarySearchNode : public SearchStrategyNode {
+   }
+ };
+ 
+-std::vector<Schedule> EvolutionarySearchNode::State::PickBestFromDatabase(int num) {
++std::vector<SearchCandidate> EvolutionarySearchNode::State::PickBestFromDatabase(int num) {
+   auto _ = Profiler::TimedScope("EvoSearch/PickBestFromDatabase");
+   std::vector<s_tir::Trace> measured_traces;
+   measured_traces.reserve(num);
+@@ -488,17 +595,21 @@ std::vector<Schedule> EvolutionarySearchNode::State::PickBestFromDatabase(int nu
+   }
+   int actual_num = measured_traces.size();
+   ThreadedTraceApply pp(self->postprocs_);
+-  std::vector<Schedule> results(actual_num, Schedule{nullptr});
++  std::vector<SearchCandidate> results(actual_num);
+   auto f_proc_measured = [this, &measured_traces, &results, &pp](int thread_id,
+                                                                  int trace_id) -> void {
+     PerThreadData& data = this->per_thread_data_.at(thread_id);
+     TRandState* rand_state = &data.rand_state;
+     const IRModule& mod = data.mod;
+     s_tir::Trace trace = measured_traces.at(trace_id);
+-    Schedule& result = results.at(trace_id);
+-    TVM_FFI_ICHECK(!result.defined());
++    SearchCandidate& result = results.at(trace_id);
++    TVM_FFI_ICHECK(!result.sch.defined());
+     if (ffi::Optional<Schedule> sch = pp.Apply(mod, trace, rand_state)) {
+-      result = sch.value();
++      result.sch = sch.value();
++      result.root_source = "database_seed";
++      result.root_source_index = trace_id;
++      result.initial_population_slot = trace_id;
++      result.root_trace = result.sch->trace().value()->Simplified(/*remove_postproc=*/true);
+     }
+   };
+   support::parallel_for_dynamic(0, actual_num, self->ctx_->num_threads, f_proc_measured);
+@@ -509,42 +620,46 @@ std::vector<Schedule> EvolutionarySearchNode::State::PickBestFromDatabase(int nu
+         << "PickBestFromDatabase skipped " << pp.TraceFailCount()
+         << " candidate(s) due to trace replay failures";
+   }
+-  std::vector<Schedule> filtered;
++  std::vector<SearchCandidate> filtered;
+   filtered.reserve(actual_num);
+-  for (const Schedule& sch : results) {
+-    if (sch.defined()) {
+-      filtered.push_back(sch);
++  for (SearchCandidate& candidate : results) {
++    if (candidate.sch.defined()) {
++      filtered.push_back(std::move(candidate));
+     }
+   }
+   return filtered;
+ }
+ 
+-std::vector<Schedule> EvolutionarySearchNode::State::SampleInitPopulation(int num) {
++std::vector<SearchCandidate> EvolutionarySearchNode::State::SampleInitPopulation(int num) {
+   auto _ = Profiler::TimedScope("EvoSearch/SampleInitPopulation");
+   ThreadedTraceApply pp(self->postprocs_);
+-  std::vector<Schedule> out_schs;
++  std::vector<SearchCandidate> out_candidates;
+   int fail_count = 0;
+-  while (static_cast<int>(out_schs.size()) < self->init_min_unmeasured &&
++  while (static_cast<int>(out_candidates.size()) < self->init_min_unmeasured &&
+          fail_count < self->max_fail_count) {
+-    std::vector<Schedule> results(num, Schedule{nullptr});
++    std::vector<SearchCandidate> results(num);
+     auto f_proc_unmeasured = [this, &results, &pp](int thread_id, int trace_id) -> void {
+       PerThreadData& data = this->per_thread_data_.at(thread_id);
+       TRandState* rand_state = &data.rand_state;
+       const IRModule& mod = data.mod;
+-      Schedule& result = results.at(trace_id);
+-      TVM_FFI_ICHECK(!result.defined());
++      SearchCandidate& result = results.at(trace_id);
++      TVM_FFI_ICHECK(!result.sch.defined());
+       int design_space_index = s_tir::SampleInt(rand_state, 0, design_spaces.size());
+       s_tir::Trace trace(design_spaces[design_space_index]->insts, {});
+       if (ffi::Optional<Schedule> sch = pp.Apply(mod, trace, rand_state)) {
+-        result = sch.value();
++        result.sch = sch.value();
++        result.root_source = "random_design_space";
++        result.root_source_index = design_space_index;
++        result.root_trace = result.sch->trace().value()->Simplified(/*remove_postproc=*/true);
+       }
+     };
+     support::parallel_for_dynamic(0, num, self->ctx_->num_threads, f_proc_unmeasured);
+     bool found_new = false;
+     for (int i = 0; i < num; i++) {
+-      if (results[i].defined()) {
++      if (results[i].sch.defined()) {
+         found_new = true;
+-        out_schs.push_back(results[i]);
++        results[i].initial_population_slot = out_candidates.size();
++        out_candidates.push_back(std::move(results[i]));
+       }
+     }
+     fail_count += !found_new;
+@@ -556,42 +671,48 @@ std::vector<Schedule> EvolutionarySearchNode::State::SampleInitPopulation(int nu
+           << " trace replay failure(s); invalid candidates were skipped";
+     }
+   }
+-  return out_schs;
++  return out_candidates;
+ }
+ 
+-std::vector<Schedule> EvolutionarySearchNode::State::EvolveWithCostModel(
+-    std::vector<Schedule> population, int num) {
++std::vector<SearchCandidate> EvolutionarySearchNode::State::EvolveWithCostModel(
++    std::vector<SearchCandidate> population, int num) {
+   IRModuleSet exists(database_->GetModuleEquality());
+   {
+     auto _ = Profiler::TimedScope("EvoSearch/Evolve/Misc/CopyMeasuredWorkloads");
+     TVM_FFI_ICHECK_GT(num, 0);
+-    // The heap to record best schedule, we do not consider schedules that are already measured
++    // The heap records best schedules that have not already been measured.
+     exists = this->measured_workloads_;
+   }
+   SizedHeap heap(num);
+   for (int iter = 0;; ++iter) {
+-    // Predict normalized score with the cost model,
+-    std::vector<double> scores =
+-        PredictNormalizedScore(population, ffi::GetRef<TuneContext>(self->ctx_), this->cost_model_);
++    std::vector<Schedule> population_schedules;
++    population_schedules.reserve(population.size());
++    for (const SearchCandidate& candidate : population) {
++      population_schedules.push_back(candidate.sch);
++    }
++
++    // Predict normalized score with the cost model.
++    std::vector<double> scores = PredictNormalizedScore(
++        population_schedules, ffi::GetRef<TuneContext>(self->ctx_), this->cost_model_);
+ 
+     {
+       auto _ = Profiler::TimedScope("EvoSearch/Evolve/Misc");
+       TVM_FFI_ICHECK_EQ(scores.size(), population.size());
+       for (int i = 0, n = population.size(); i < n; ++i) {
+-        Schedule sch = population.at(i);
+-        IRModule mod = sch->mod();
++        const SearchCandidate& candidate = population.at(i);
++        IRModule mod = candidate.sch->mod();
+         size_t shash = ModuleHash(mod);
+         double score = scores.at(i);
+         if (!exists.Has(mod, shash)) {
+           exists.Add(mod, shash);
+-          heap.Push(sch, score);
++          heap.Push(candidate, score);
+         }
+       }
+-      // Discontinue once it reaches end of search
++      // Discontinue once it reaches end of search.
+       if (iter == self->genetic_num_iters) {
+         break;
+       }
+-      // Set threaded samplers, with probability from predicated normalized throughput
++      // Set threaded samplers using predicted normalized throughput.
+       for (PerThreadData& data : this->per_thread_data_) {
+         data.Set(scores, self->genetic_mutate_prob, self->mutator_probs_);
+       }
+@@ -600,44 +721,65 @@ std::vector<Schedule> EvolutionarySearchNode::State::EvolveWithCostModel(
+       auto _ = Profiler::TimedScope("EvoSearch/Evolve/Mutation");
+       ThreadedTraceApply pp(self->postprocs_);
+       ConcurrentBitmask cbmask(self->population_size);
+-      std::vector<Schedule> next_population(self->population_size, Schedule{nullptr});
+-      // The worker function
+-      auto f_find_candidate = [&cbmask, &population, &next_population, &pp, this](int thread_id,
+-                                                                                  int trace_id) {
+-        // Prepare samplers
+-        PerThreadData& data = this->per_thread_data_.at(thread_id);
+-        TRandState* rand_state = &data.rand_state;
+-        const IRModule& mod = data.mod;
+-        std::function<int()>& trace_sampler = data.trace_sampler;
+-        std::function<ffi::Optional<Mutator>()>& mutator_sampler = data.mutator_sampler;
+-        Schedule& result = next_population.at(trace_id);
+-        int sampled_trace_id = -1;
+-        // Loop until success
+-        for (int fail_count = 0; fail_count <= self->genetic_max_fail_count; ++fail_count) {
+-          sampled_trace_id = trace_sampler();
+-          sampled_trace_id = sampled_trace_id % self->population_size;
+-          s_tir::Trace trace = population.at(sampled_trace_id)->trace().value();
+-          if (ffi::Optional<Mutator> opt_mutator = mutator_sampler()) {
+-            // Decision: mutate
+-            Mutator mutator = opt_mutator.value();
+-            if (ffi::Optional<s_tir::Trace> new_trace = mutator->Apply(trace, rand_state)) {
+-              if (ffi::Optional<Schedule> sch = pp.Apply(mod, new_trace.value(), rand_state)) {
+-                // note that sch's trace is different from new_trace
+-                // because it contains post-processing information
+-                result = sch.value();
++      std::vector<SearchCandidate> next_population(self->population_size);
++      // The worker function.
++      auto f_find_candidate =
++          [&cbmask, &population, &next_population, &pp, &scores, this, iter](
++              int thread_id, int trace_id) {
++            PerThreadData& data = this->per_thread_data_.at(thread_id);
++            TRandState* rand_state = &data.rand_state;
++            const IRModule& mod = data.mod;
++            std::function<int()>& trace_sampler = data.trace_sampler;
++            std::function<ffi::Optional<Mutator>()>& mutator_sampler = data.mutator_sampler;
++            SearchCandidate& result = next_population.at(trace_id);
++            int sampled_trace_id = -1;
++            // Loop until success.
++            for (int fail_count = 0; fail_count <= self->genetic_max_fail_count; ++fail_count) {
++              sampled_trace_id = trace_sampler();
++              sampled_trace_id = sampled_trace_id % self->population_size;
++              const SearchCandidate& parent = population.at(sampled_trace_id);
++              s_tir::Trace trace = parent.sch->trace().value();
++              if (ffi::Optional<Mutator> opt_mutator = mutator_sampler()) {
++                // Decision: mutate.
++                Mutator mutator = opt_mutator.value();
++                TRandState rng_state_before = *rand_state;
++                if (ffi::Optional<s_tir::Trace> new_trace = mutator->Apply(trace, rand_state)) {
++                  TRandState rng_state_after = *rand_state;
++                  if (ffi::Optional<Schedule> sch = pp.Apply(mod, new_trace.value(), rand_state)) {
++                    // The schedule trace additionally contains post-processing instructions.
++                    auto mutation = std::make_shared<MutationProvenance>();
++                    mutation->parent = parent.lineage;
++                    mutation->generation = iter;
++                    mutation->thread_id = thread_id;
++                    mutation->retry_index = fail_count;
++                    mutation->parent_population_index = sampled_trace_id;
++                    mutation->mutator_type = mutator->GetTypeKey();
++                    mutation->rng_state_before = rng_state_before;
++                    mutation->rng_state_after = rng_state_after;
++                    mutation->parent_normalized_score = scores.at(sampled_trace_id);
++                    mutation->parent_trace = trace->Simplified(/*remove_postproc=*/true);
++                    mutation->mutated_trace =
++                        new_trace.value()->Simplified(/*remove_postproc=*/true);
++
++                    result = parent;
++                    result.sch = sch.value();
++                    result.lineage = std::move(mutation);
++                    result.selection_source = "";
++                    result.has_predicted_score = false;
++                    result.predicted_normalized_score = 0.0;
++                    break;
++                  }
++                }
++              } else if (cbmask.QueryAndMark(sampled_trace_id)) {
++                // Decision: do not mutate.
+                 break;
+               }
+             }
+-          } else if (cbmask.QueryAndMark(sampled_trace_id)) {
+-            // Decision: do not mutate
+-            break;
+-          }
+-        }
+-        // if retry count exceeds the limit, reuse an old sample
+-        if (!result.defined()) {
+-          result = population.at(sampled_trace_id);
+-        }
+-      };
++            // If retries are exhausted, reuse the exact old candidate and ancestry.
++            if (!result.sch.defined()) {
++              result = population.at(sampled_trace_id);
++            }
++          };
+       support::parallel_for_dynamic(0, self->population_size, self->ctx_->num_threads,
+                                     f_find_candidate);
+ 
+@@ -646,14 +788,14 @@ std::vector<Schedule> EvolutionarySearchNode::State::EvolveWithCostModel(
+                                            << pp.SummarizeFailures();
+     }
+   }
+-  // Return the best states from the heap, sorting from higher score to lower ones
++  // Return the best states from the heap, sorting from higher score to lower ones.
+   {
+     auto _ = Profiler::TimedScope("EvoSearch/Evolve/Misc");
+     std::sort(heap.heap.begin(), heap.heap.end());
+-    std::vector<Schedule> results;
++    std::vector<SearchCandidate> results;
+     results.reserve(num);
+     for (const SizedHeap::Item& item : heap.heap) {
+-      results.push_back(item.sch);
++      results.push_back(item.candidate);
+     }
+ 
+     constexpr int kNumScoresPerLine = 16;
+@@ -676,45 +818,49 @@ std::vector<Schedule> EvolutionarySearchNode::State::EvolveWithCostModel(
+   }
+ }
+ 
+-std::vector<Schedule> EvolutionarySearchNode::State::PickWithEpsGreedy(
+-    const std::vector<Schedule>& unmeasured, const std::vector<Schedule>& bests, int num) {
++std::vector<SearchCandidate> EvolutionarySearchNode::State::PickWithEpsGreedy(
++    const std::vector<SearchCandidate>& unmeasured,
++    const std::vector<SearchCandidate>& bests, int num) {
+   auto _ = Profiler::TimedScope("EvoSearch/PickWithEpsGreedy");
+   int num_rands = num * self->eps_greedy;
+   int num_bests = num - num_rands;
+   std::vector<int> rands =
+       s_tir::SampleWithoutReplacement(&self->rand_state_, unmeasured.size(), unmeasured.size());
+-  std::vector<Schedule> results;
++  std::vector<SearchCandidate> results;
+   results.reserve(num);
+   IRModuleSet& measured_workloads = this->measured_workloads_;
+   for (int i = 0, i_bests = 0, i_rands = 0; i < num; ++i) {
+     bool has_best = i_bests < static_cast<int>(bests.size());
+     bool has_rand = i_rands < static_cast<int>(rands.size());
+-    // Pick a schedule
+-    Schedule sch{nullptr};
+-    // If needs `bests`, then prefer `bests`
++    SearchCandidate candidate;
++    // If this slot needs bests, prefer a cost-model candidate.
+     if (i < num_bests) {
+       if (has_best) {
+-        sch = bests[i_bests++];
++        candidate = bests[i_bests++];
++        candidate.selection_source = "cost_model_best";
+       } else if (has_rand) {
+-        sch = unmeasured[rands[i_rands++]];
++        candidate = unmeasured[rands[i_rands++]];
++        candidate.selection_source = "epsilon_random_fallback";
+       } else {
+         break;
+       }
+     } else {
+-      // Else prefer `rands`
++      // Otherwise prefer a random initial candidate.
+       if (has_rand) {
+-        sch = unmeasured[rands[i_rands++]];
++        candidate = unmeasured[rands[i_rands++]];
++        candidate.selection_source = "epsilon_random";
+       } else if (has_best) {
+-        sch = bests[i_bests++];
++        candidate = bests[i_bests++];
++        candidate.selection_source = "cost_model_best_fallback";
+       } else {
+         break;
+       }
+     }
+-    IRModule mod = sch->mod();
++    IRModule mod = candidate.sch->mod();
+     size_t shash = ModuleHash(mod);
+     if (!measured_workloads.Has(mod, shash)) {
+       measured_workloads.Add(mod, shash);
+-      results.push_back(sch);
++      results.push_back(std::move(candidate));
+     }
+   }
+   return results;
+@@ -732,26 +878,37 @@ EvolutionarySearchNode::State::GenerateMeasureCandidates() {
+   }
+   TVM_FFI_ICHECK_LT(st, ed);
+   int pop = self->population_size;
+-  std::vector<Schedule> inits;
++  std::vector<SearchCandidate> inits;
+   inits.reserve(pop);
+ 
+   TVM_PY_LOG(INFO, self->ctx_->logger) << "Generating candidates......";
+-  std::vector<Schedule> measured = PickBestFromDatabase(pop * self->init_measured_ratio);
++  std::vector<SearchCandidate> measured =
++      PickBestFromDatabase(pop * self->init_measured_ratio);
+   TVM_PY_LOG(INFO, self->ctx_->logger)
+       << "Picked top " << measured.size() << " candidate(s) from database";
+-  std::vector<Schedule> unmeasured = SampleInitPopulation(pop - measured.size());
++  std::vector<SearchCandidate> unmeasured =
++      SampleInitPopulation(pop - measured.size());
+   if (static_cast<int>(unmeasured.size()) < self->init_min_unmeasured) {
+     TVM_PY_LOG(WARNING, self->ctx_->logger)
+         << "Cannot sample enough initial population, evolutionary search failed.";
+     return std::nullopt;
+   }
+   TVM_PY_LOG(INFO, self->ctx_->logger) << "Sampled " << unmeasured.size() << " candidate(s)";
++
++  for (int index = 0, size = measured.size(); index < size; ++index) {
++    measured[index].initial_population_slot = index;
++  }
++  for (int index = 0, size = unmeasured.size(); index < size; ++index) {
++    unmeasured[index].initial_population_slot = measured.size() + index;
++  }
+   inits.insert(inits.end(), measured.begin(), measured.end());
+   inits.insert(inits.end(), unmeasured.begin(), unmeasured.end());
+-  std::vector<Schedule> bests = EvolveWithCostModel(inits, sample_num);
++
++  std::vector<SearchCandidate> bests = EvolveWithCostModel(inits, sample_num);
+   TVM_PY_LOG(INFO, self->ctx_->logger)
+       << "Got " << bests.size() << " candidate(s) with evolutionary search";
+-  std::vector<Schedule> picks = PickWithEpsGreedy(unmeasured, bests, sample_num);
++  std::vector<SearchCandidate> picks =
++      PickWithEpsGreedy(unmeasured, bests, sample_num);
+   TVM_PY_LOG(INFO, self->ctx_->logger)
+       << "Sending " << picks.size() << " candidates(s) for measurement";
+   if (picks.empty()) {
+@@ -760,7 +917,7 @@ EvolutionarySearchNode::State::GenerateMeasureCandidates() {
+       return std::nullopt;
+     }
+   }
+-  return AssembleCandidates(picks);
++  return AssembleCandidatesWithProvenance(picks);
+ }
+ 
+ void EvolutionarySearchNode::State::NotifyRunnerResults(
+@@ -805,18 +962,35 @@ class EvolutionarySearch : public SearchStrategy {
+ };
+ 
+ ffi::Array<Schedule> EvolutionarySearchSampleInitPopulation(EvolutionarySearch self, int num) {
+-  std::vector<Schedule> results = self->state_->SampleInitPopulation(num);
+-  return ffi::Array<Schedule>(results.begin(), results.end());
++  std::vector<SearchCandidate> candidates = self->state_->SampleInitPopulation(num);
++  ffi::Array<Schedule> results;
++  results.reserve(candidates.size());
++  for (const SearchCandidate& candidate : candidates) {
++    results.push_back(candidate.sch);
++  }
++  return results;
+ }
+ 
+ ffi::Array<Schedule> EvolutionarySearchEvolveWithCostModel(EvolutionarySearch self,
+                                                            ffi::Array<Schedule> population,
+                                                            int num) {
+   ffi::Array<Schedule> result;
+-  std::vector<Schedule> population_vec =
+-      std::vector<Schedule>(population.begin(), population.end());
+-  std::vector<Schedule> schs = self->state_->EvolveWithCostModel(population_vec, num);
+-  for (Schedule sch : schs) {
++  std::vector<SearchCandidate> population_candidates;
++  population_candidates.reserve(population.size());
++  for (int index = 0, size = population.size(); index < size; ++index) {
++    const Schedule& sch = population[index];
++    SearchCandidate candidate;
++    candidate.sch = sch;
++    candidate.root_source = "ffi_population";
++    candidate.root_source_index = index;
++    candidate.initial_population_slot = index;
++    candidate.root_trace = sch->trace().value()->Simplified(/*remove_postproc=*/true);
++    population_candidates.push_back(std::move(candidate));
++  }
++  std::vector<SearchCandidate> candidates =
++      self->state_->EvolveWithCostModel(std::move(population_candidates), num);
++  for (const SearchCandidate& candidate : candidates) {
++    const Schedule& sch = candidate.sch;
+     IRModule mod = sch->mod();
+     size_t shash = self->state_->ModuleHash(mod);
+     if (!self->state_->measured_workloads_.Has(mod, shash)) {
+diff --git a/src/s_tir/meta_schedule/search_strategy/search_strategy.cc b/src/s_tir/meta_schedule/search_strategy/search_strategy.cc
+index 284404b40..fdd70de30 100644
+--- a/src/s_tir/meta_schedule/search_strategy/search_strategy.cc
++++ b/src/s_tir/meta_schedule/search_strategy/search_strategy.cc
+@@ -24,10 +24,13 @@ namespace tvm {
+ namespace s_tir {
+ namespace meta_schedule {
+ 
+-MeasureCandidate::MeasureCandidate(s_tir::Schedule sch, ffi::Array<ArgInfo> args_info) {
++MeasureCandidate::MeasureCandidate(
++    s_tir::Schedule sch, ffi::Array<ArgInfo> args_info,
++    ffi::Optional<ffi::Map<ffi::String, ffi::Any>> provenance) {
+   ffi::ObjectPtr<MeasureCandidateNode> n = ffi::make_object<MeasureCandidateNode>();
+   n->sch = sch;
+   n->args_info = args_info;
++  n->provenance = std::move(provenance);
+   data_ = std::move(n);
+ }
+ 
+@@ -96,8 +99,10 @@ TVM_FFI_STATIC_INIT_BLOCK() {
+   namespace refl = tvm::ffi::reflection;
+   refl::GlobalDef()
+       .def("s_tir.meta_schedule.MeasureCandidate",
+-           [](s_tir::Schedule sch, ffi::Optional<ffi::Array<ArgInfo>> args_info)
+-               -> MeasureCandidate { return MeasureCandidate(sch, args_info.value_or({})); })
++           [](s_tir::Schedule sch, ffi::Optional<ffi::Array<ArgInfo>> args_info,
++              ffi::Optional<ffi::Map<ffi::String, ffi::Any>> provenance) -> MeasureCandidate {
++             return MeasureCandidate(sch, args_info.value_or({}), std::move(provenance));
++           })
+       .def("s_tir.meta_schedule.SearchStrategyPySearchStrategy", SearchStrategy::PySearchStrategy)
+       .def_method("s_tir.meta_schedule.SearchStrategyInitializeWithTuneContext",
+                   &SearchStrategyNode::InitializeWithTuneContext)
